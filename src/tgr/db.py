@@ -134,6 +134,11 @@ class RadarDB:
         finally:
             conn.close()
 
+    def is_empty(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM folder_rules").fetchone()
+            return int(row[0]) == 0
+
     def bump_revision(self, conn: sqlite3.Connection | None = None) -> int:
         now = self._now()
         if conn is None:
@@ -158,7 +163,7 @@ class RadarDB:
         with self.tx() as conn:
             conn.execute(
                 "INSERT INTO ops_log(level, action, detail, created_at) VALUES (?, ?, ?, ?)",
-                (level, action, detail, self._now()),
+                (level, action, detail[:2000], self._now()),
             )
 
     def recent_logs(self, limit: int = 20) -> list[sqlite3.Row]:
@@ -193,22 +198,36 @@ class RadarDB:
         self,
         folder_name: str,
         folder_id: int | None,
-        enabled: bool = False,
+        enabled: bool | None = None,
         alert_channel_id: int | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> None:
         now = self._now()
-        sql = (
-            "INSERT INTO folder_rules(folder_name, folder_id, enabled, alert_channel_id, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(folder_name) DO UPDATE SET folder_id=excluded.folder_id, updated_at=excluded.updated_at"
-        )
-        params = (folder_name, folder_id, int(enabled), alert_channel_id, now, now)
+
+        def _apply(c: sqlite3.Connection) -> None:
+            existing = c.execute(
+                "SELECT enabled, alert_channel_id FROM folder_rules WHERE folder_name=?",
+                (folder_name,),
+            ).fetchone()
+            effective_enabled = int(enabled) if enabled is not None else (int(existing["enabled"]) if existing else 0)
+            effective_alert = alert_channel_id if alert_channel_id is not None or existing is None else existing["alert_channel_id"]
+            c.execute(
+                "INSERT INTO folder_rules(folder_name, folder_id, enabled, alert_channel_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(folder_name) DO UPDATE SET folder_id=excluded.folder_id, updated_at=excluded.updated_at",
+                (folder_name, folder_id, effective_enabled, effective_alert, now, now),
+            )
+            if existing is None:
+                c.execute(
+                    "UPDATE folder_rules SET enabled=?, alert_channel_id=? WHERE folder_name=?",
+                    (effective_enabled, effective_alert, folder_name),
+                )
+
         if conn is None:
             with self.tx() as own:
-                own.execute(sql, params)
+                _apply(own)
         else:
-            conn.execute(sql, params)
+            _apply(conn)
 
     def rename_folder(self, old_name: str, new_name: str, folder_id: int | None = None, conn: sqlite3.Connection | None = None) -> None:
         now = self._now()
@@ -223,6 +242,7 @@ class RadarDB:
         if conn is None:
             with self.tx() as own:
                 _rename(own)
+                self.bump_revision(own)
         else:
             _rename(conn)
 
@@ -230,6 +250,7 @@ class RadarDB:
         if conn is None:
             with self.tx() as own:
                 own.execute("DELETE FROM folder_rules WHERE folder_name=?", (folder_name,))
+                self.bump_revision(own)
         else:
             conn.execute("DELETE FROM folder_rules WHERE folder_name=?", (folder_name,))
 
@@ -262,15 +283,21 @@ class RadarDB:
             )
             self.bump_revision(conn)
 
-    def upsert_rule(self, folder_name: str, rule_name: str, pattern: str) -> None:
-        with self.tx() as conn:
+    def upsert_rule(self, folder_name: str, rule_name: str, pattern: str, conn: sqlite3.Connection | None = None) -> None:
+        def _apply(c: sqlite3.Connection) -> None:
             now = self._now()
-            conn.execute(
+            c.execute(
                 "INSERT INTO keyword_rules(folder_name, rule_name, pattern, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?) "
                 "ON CONFLICT(folder_name, rule_name) DO UPDATE SET pattern=excluded.pattern, enabled=1, updated_at=excluded.updated_at",
                 (folder_name, rule_name, pattern, now, now),
             )
-            self.bump_revision(conn)
+
+        if conn is None:
+            with self.tx() as own:
+                _apply(own)
+                self.bump_revision(own)
+        else:
+            _apply(conn)
 
     def delete_rule(self, folder_name: str, rule_name: str) -> bool:
         with self.tx() as conn:
@@ -294,7 +321,7 @@ class RadarDB:
     def get_rules_for_folder(self, folder_name: str) -> list[sqlite3.Row]:
         with self._connect() as conn:
             return conn.execute(
-                "SELECT rule_name, pattern, enabled, updated_at FROM keyword_rules WHERE folder_name=? ORDER BY rule_name COLLATE NOCASE",
+                "SELECT rule_name, pattern, enabled, updated_at FROM keyword_rules WHERE folder_name=? AND enabled=1 ORDER BY rule_name COLLATE NOCASE",
                 (folder_name,),
             ).fetchall()
 
@@ -341,6 +368,7 @@ class RadarDB:
         if conn is None:
             with self.tx() as own:
                 _apply(own)
+                self.bump_revision(own)
         else:
             _apply(conn)
 
@@ -427,3 +455,88 @@ class RadarDB:
                 "SELECT COUNT(*) FROM pending_route_tasks WHERE status IN ('pending', 'retry', 'running')"
             ).fetchone()
             return int(row[0])
+
+    def export_legacy_snapshot(self) -> dict[str, Any]:
+        folder_rules: dict[str, Any] = {}
+        system_cache: dict[str, list[int]] = {}
+        auto_route_rules: dict[str, str] = {}
+        with self._connect() as conn:
+            for folder in conn.execute(
+                "SELECT folder_name, folder_id, enabled, alert_channel_id FROM folder_rules ORDER BY folder_name COLLATE NOCASE"
+            ).fetchall():
+                rules_rows = conn.execute(
+                    "SELECT rule_name, pattern FROM keyword_rules WHERE folder_name=? AND enabled=1 ORDER BY rule_name COLLATE NOCASE",
+                    (folder["folder_name"],),
+                ).fetchall()
+                folder_rules[folder["folder_name"]] = {
+                    "id": folder["folder_id"],
+                    "enable": bool(folder["enabled"]),
+                    "alert_channel_id": folder["alert_channel_id"],
+                    "rules": {row["rule_name"]: row["pattern"] for row in rules_rows},
+                }
+                cache_rows = conn.execute(
+                    "SELECT chat_id FROM system_cache WHERE folder_name=? ORDER BY chat_id",
+                    (folder["folder_name"],),
+                ).fetchall()
+                system_cache[folder["folder_name"]] = [int(row["chat_id"]) for row in cache_rows]
+            for row in conn.execute(
+                "SELECT folder_name, pattern FROM auto_route_rules ORDER BY folder_name COLLATE NOCASE"
+            ).fetchall():
+                auto_route_rules[row["folder_name"]] = row["pattern"]
+        return {
+            "folder_rules": folder_rules,
+            "_system_cache": system_cache,
+            "auto_route_rules": auto_route_rules,
+        }
+
+    def import_legacy_snapshot(self, payload: dict[str, Any]) -> bool:
+        folder_rules = payload.get("folder_rules") or {}
+        system_cache = payload.get("_system_cache") or {}
+        auto_routes = payload.get("auto_route_rules") or {}
+        if not folder_rules and not auto_routes:
+            return False
+
+        with self.tx() as conn:
+            conn.execute("DELETE FROM auto_route_rules")
+            conn.execute("DELETE FROM keyword_rules")
+            conn.execute("DELETE FROM system_cache")
+            conn.execute("DELETE FROM folder_rules")
+            now = self._now()
+
+            for folder_name, cfg in folder_rules.items():
+                folder_id = cfg.get("id")
+                enabled = 1 if cfg.get("enable") else 0
+                alert_channel_id = cfg.get("alert_channel_id")
+                conn.execute(
+                    "INSERT INTO folder_rules(folder_name, folder_id, enabled, alert_channel_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (folder_name, folder_id, enabled, alert_channel_id, now, now),
+                )
+                rules = cfg.get("rules") or {}
+                for rule_name, pattern in rules.items():
+                    conn.execute(
+                        "INSERT INTO keyword_rules(folder_name, rule_name, pattern, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+                        (folder_name, rule_name, str(pattern), now, now),
+                    )
+                for chat_id in system_cache.get(folder_name, []) or []:
+                    try:
+                        cid = int(chat_id)
+                    except Exception:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO system_cache(folder_name, chat_id, chat_title) VALUES (?, ?, NULL)",
+                        (folder_name, cid),
+                    )
+
+            for folder_name, pattern in auto_routes.items():
+                if not conn.execute("SELECT 1 FROM folder_rules WHERE folder_name=?", (folder_name,)).fetchone():
+                    conn.execute(
+                        "INSERT INTO folder_rules(folder_name, folder_id, enabled, alert_channel_id, created_at, updated_at) VALUES (?, NULL, 0, NULL, ?, ?)",
+                        (folder_name, now, now),
+                    )
+                conn.execute(
+                    "INSERT INTO auto_route_rules(folder_name, pattern, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (folder_name, str(pattern), now, now),
+                )
+
+            self.bump_revision(conn)
+        return True

@@ -72,10 +72,8 @@ kill_residual_processes() {
     "$APP_DIR/src/sync_once.py"
     "/root/TG-Radar/tg_monitor.py"
     "/root/TG-Radar/sync_engine.py"
-    "/opt/TG-Radar-PlanC/src/radar_admin.py"
-    "/opt/TG-Radar-PlanC/src/radar_core.py"
-    "/opt/TG-Radar-PlanC/radar_admin.py"
-    "/opt/TG-Radar-PlanC/radar_core.py"
+    "/root/TG-Radar-PlanC/src/radar_admin.py"
+    "/root/TG-Radar-PlanC/src/radar_core.py"
   )
   local p
   for p in "${patterns[@]}"; do
@@ -113,7 +111,7 @@ cleanup_legacy() {
   kill_residual_processes
 
   if [ "$purge_dirs" = "1" ]; then
-    for dir in /root/TG-Radar /opt/TG-Radar-PlanC /opt/TGRC; do
+    for dir in /root/TG-Radar /root/TG-Radar-PlanC /opt/TG-Radar-PlanC /opt/TGRC; do
       [ -d "$dir" ] || continue
       if [ "$keep_current" = "1" ] && [ "$dir" = "$APP_DIR" ]; then
         continue
@@ -195,6 +193,16 @@ stop_services(){ ensure_root; systemctl stop "$ADMIN_SVC" "$CORE_SVC" || true; o
 restart_services(){ ensure_root; systemctl restart "$ADMIN_SVC" "$CORE_SVC"; ok "服务已重启。"; }
 sync_once(){ cd "$APP_DIR"; PYTHONPATH="$SRC_DIR" "$PY" "$SRC_DIR/sync_once.py"; }
 reauth(){ cd "$APP_DIR"; PYTHONPATH="$SRC_DIR" "$PY" "$SRC_DIR/bootstrap_session.py" </dev/tty; }
+update_repo(){
+  ensure_root
+  if [ ! -d "$APP_DIR/.git" ]; then
+    err "当前目录不是 git 仓库，无法执行 TGRC update。"
+    exit 1
+  fi
+  git -C "$APP_DIR" pull --ff-only
+  ok "代码已更新。"
+  restart_services
+}
 
 runtime_db="$APP_DIR/runtime/radar.db"
 admin_session_file="$APP_DIR/runtime/sessions/tg_radar_admin.session"
@@ -267,7 +275,7 @@ menu() {
   clear
   line
   printf "%b\n" "${B}TGRC · Telegram Radar Command Center${C0}"
-  printf "%b\n" "${DIM}Clean install · src layout · Core/Admin split · SQLite WAL${C0}"
+  printf "%b\n" "${DIM}Plan C 架构 · 保留原始监控逻辑 · /root 一键部署${C0}"
   line
   cat <<'MENU'
 1) 写入 / 刷新 systemd 服务
@@ -281,7 +289,8 @@ menu() {
 9) 重新授权 Telegram
 10) 运行 Doctor 自检
 11) 清理旧版残留（服务 / 命令 / 进程）
-12) 彻底卸载（删除服务 / 命令 / 项目目录）
+12) git pull 更新并重启
+13) 彻底卸载（删除服务 / 命令 / 项目目录）
 0) 退出
 MENU
   line
@@ -296,6 +305,7 @@ case "${1:-menu}" in
   sync) sync_once ;;
   reauth) reauth ;;
   doctor) doctor ;;
+  update) update_repo ;;
   cleanup-legacy)
     keep_current=0
     [ "${2:-}" = "--keep-current" ] && keep_current=1
@@ -328,7 +338,8 @@ case "${1:-menu}" in
         9) reauth ;;
         10) doctor ;;
         11) cleanup_legacy 1 1 ;;
-        12) uninstall_all ask ;;
+        12) update_repo ;;
+        13) uninstall_all ask ;;
         0) exit 0 ;;
         *) warn "无效选项" ;;
       esac
@@ -349,6 +360,7 @@ case "${1:-menu}" in
   TGRC reauth              重新授权 Telegram
   TGRC logs [admin|core]   查看日志
   TGRC doctor              运行环境自检
+  TGRC update              git pull 更新并重启
   TGRC cleanup-legacy      清理旧版服务 / 命令 / 后台进程
   TGRC uninstall           彻底卸载（默认删除项目目录）
   TGRC uninstall keep-data 卸载服务与命令，但保留项目目录

@@ -63,10 +63,12 @@ def normalize_pattern_from_terms(raw: str) -> str:
 
 
 def try_remove_terms_from_pattern(pattern: str, terms: Iterable[str]) -> str | None:
-    tokens = [t for t in re.split(r"(?<!\\)\|", pattern.strip("()")) if t]
-    cleaned = {t.strip() for t in terms if t.strip()}
-    if not tokens:
+    pattern = pattern.strip()
+    if not pattern:
         return None
+    inner = pattern[1:-1] if pattern.startswith("(") and pattern.endswith(")") else pattern
+    tokens = [t.strip() for t in re.split(r"(?<!\\)\|", inner) if t.strip()]
+    cleaned = {t.strip() for t in terms if t.strip()}
     left = [token for token in tokens if token not in cleaned and html.unescape(token) not in cleaned]
     if not left:
         return None

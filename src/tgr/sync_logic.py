@@ -29,6 +29,9 @@ class RouteReport:
     errors: dict[str, str]
 
 
+DEFAULT_DEMO_PATTERN = "(示范词A|示范词B)"
+
+
 async def sync_dialog_folders(client: TelegramClient, db: RadarDB) -> SyncReport:
     started = datetime.now()
     discovered: list[str] = []
@@ -54,11 +57,13 @@ async def sync_dialog_folders(client: TelegramClient, db: RadarDB) -> SyncReport
             current_ids.add(folder_id)
 
             if folder_id in id_to_name and id_to_name[folder_id] != title:
-                db.rename_folder(id_to_name[folder_id], title, folder_id=folder_id, conn=conn)
-                renamed.append((id_to_name[folder_id], title))
+                old_name = id_to_name[folder_id]
+                db.rename_folder(old_name, title, folder_id=folder_id, conn=conn)
+                renamed.append((old_name, title))
                 changed = True
             elif title not in existing_names:
                 db.upsert_folder(title, folder_id, enabled=False, alert_channel_id=None, conn=conn)
+                db.upsert_rule(title, f"{title}监控", DEFAULT_DEMO_PATTERN, conn=conn)
                 discovered.append(title)
                 changed = True
             else:
@@ -91,6 +96,15 @@ async def sync_dialog_folders(client: TelegramClient, db: RadarDB) -> SyncReport
                 if dialog is not None:
                     chat_title = getattr(dialog, "name", None) or getattr(dialog.entity, "title", None)
                 items.append((chat_id, chat_title))
+
+            old_rows = conn.execute(
+                "SELECT chat_id FROM system_cache WHERE folder_name=? ORDER BY chat_id",
+                (title,),
+            ).fetchall()
+            old_ids = [int(row["chat_id"]) for row in old_rows]
+            new_ids = [int(chat_id) for chat_id, _ in items]
+            if old_ids != new_ids:
+                changed = True
             db.replace_folder_cache(title, items, conn=conn)
             active[title] = len(items)
 

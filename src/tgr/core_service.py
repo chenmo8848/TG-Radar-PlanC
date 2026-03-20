@@ -12,6 +12,7 @@ from pathlib import Path
 
 from telethon import TelegramClient, events
 
+from .compat import seed_db_from_legacy_config_if_needed
 from .config import load_config
 from .db import RadarDB
 from .logger import setup_logger
@@ -31,6 +32,7 @@ async def run(work_dir: Path) -> None:
     config = load_config(work_dir)
     logger = setup_logger("tg-radar-core", config.logs_dir / "core.log")
     db = RadarDB(config.db_path)
+    seed_db_from_legacy_config_if_needed(work_dir, db)
     config.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     if not (config.core_session.with_suffix('.session')).exists():
@@ -114,12 +116,12 @@ async def run(work_dir: Path) -> None:
 <b>💬 原始消息快照</b>：
 <blockquote expandable>{preview}</blockquote>"""
                         if msg_link:
-                            alert_text += f'\n🔗 <a href="{msg_link}">点击跳转直达现场</a>'
+                            alert_text += f'\n🔗 <a href="{msg_link}">点击跳转直达案发现场</a>'
 
                         try:
                             await client.send_message(int(task["alert_channel"]), alert_text, link_preview=False)
                             db.increment_hit(task["folder_name"])
-                            db.log_event("HIT", "MATCH", f"{rule_name} <- {chat_title}")
+                            db.log_event("INFO", "HIT", f"{rule_name} <- {chat_title}")
                         except Exception as exc:
                             logger.exception("failed to send alert: %s", exc)
                             db.log_event("ERROR", "SEND_ALERT", str(exc))
